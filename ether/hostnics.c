@@ -126,7 +126,7 @@ unsigned hostnics (struct nic nics [], unsigned size)
 	{
 		size = next;
 	}
-	for (next = 0; next < size; next++)
+		for (next = 0; next < size && next < (ifconf.ifc_len / sizeof (struct ifreq)); next++)
 	{
 		struct nic * nic = &nics [next];
 		struct sockaddr_in * sockaddr_in = (struct sockaddr_in *)(&ifreq->ifr_addr);
