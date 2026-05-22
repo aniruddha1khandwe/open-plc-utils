@@ -1,0 +1,685 @@
+name: CI/CD Pipeline — Python → Azure
+ 
+on:
+  push:
+    branches: [ "main", "develop", "release/**" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target deployment environment"
+        required: true
+        default: "staging"
+        type: choice
+        options: [ staging, production ]
+ 
+# ── Global permissions (least-privilege) ─────────────────────
+permissions:
+  contents: read
+  security-events: write   # SARIF uploads to GitHub Security tab
+  id-token: write          # OIDC → Azure login
+  packages: write          # GHCR artifact push
+  attestations: write      # Artifact signing / SBOM attestation
+ 
+# ── Environment variables ─────────────────────────────────────
+env:
+  PYTHON_VERSION: "3.11"
+  ARTIFACT_NAME: "python-app"
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+  AZURE_VM_NAME: ${{ vars.AZURE_VM_NAME }}
+  SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+  SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+  DEPLOY_PATH: "/opt/app"
+ 
+# ── Concurrency: cancel redundant runs per branch ─────────────
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+ 
+# ═══════════════════════════════════════════════════════════════
+# JOB 1 — Pre-flight: Secrets & Credential Scanning
+# ═══════════════════════════════════════════════════════════════
+jobs:
+ 
+  secrets-scan:
+    name: "🔑 Secrets Scanning (GitHub Advanced Security)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history for secret scan
+ 
+      # GitHub Secret Scanning is enabled at the repository level.
+      # This step adds Gitleaks as a defence-in-depth layer for PRs
+      # and surfaces results as SARIF in the Security tab.
+      - name: Gitleaks — detect hardcoded secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}   # required for org-level scans
+ 
+      - name: Upload Gitleaks SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+          category: secrets
+ 
+# ═══════════════════════════════════════════════════════════════
+# JOB 2 — SAST: SonarQube
+# ═══════════════════════════════════════════════════════════════
+  sast-sonarqube:
+    name: "🔍 SAST — SonarQube"
+    runs-on: ubuntu-latest
+    needs: secrets-scan
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+ 
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+ 
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install coverage
+ 
+      - name: Run tests with coverage (feeds SonarQube)
+        run: |
+          coverage run -m pytest --junitxml=reports/test-results.xml
+          coverage xml -o reports/coverage.xml
+ 
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v3
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
+            -Dsonar.python.coverage.reportPaths=reports/coverage.xml
+            -Dsonar.python.xunit.reportPath=reports/test-results.xml
+            -Dsonar.qualitygate.wait=true
+ 
+      # Enforce Quality Gate — pipeline fails if gate is broken
+      - name: SonarQube Quality Gate check
+        uses: SonarSource/sonarqube-quality-gate-action@v1.1.0
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
+ 
+# ═══════════════════════════════════════════════════════════════
+# JOB 3 — SCA: OWASP Dependency-Check
+# ═══════════════════════════════════════════════════════════════
+  sca-owasp:
+    name: "📦 SCA — OWASP Dependency-Check"
+    runs-on: ubuntu-latest
+    needs: secrets-scan
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+ 
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+ 
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+ 
+      - name: OWASP Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@main
+        id: depcheck
+        with:
+          project: ${{ env.ARTIFACT_NAME }}
+          path: "."
+          format: "SARIF"
+          out: "reports/dependency-check"
+          args: >
+            --enableRetired
+            --failOnCVSS 7
+            --suppression dependency-check-suppressions.xml
+ 
+      - name: Upload Dependency-Check SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: reports/dependency-check/dependency-check-report.sarif
+          category: sca-owasp
+ 
+      - name: Upload Dependency-Check HTML report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: owasp-dependency-check-report
+          path: reports/dependency-check/
+ 
+# ═══════════════════════════════════════════════════════════════
+# JOB 4 — IaC Scanning: tfsec
+# ═══════════════════════════════════════════════════════════════
+  iac-tfsec:
+    name: "🏗️ IaC Scan — tfsec"
+    runs-on: ubuntu-latest
+    needs: secrets-scan
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+ 
+      - name: tfsec — Terraform static analysis
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          soft_fail: false
+          format: sarif
+          sarif_file: tfsec.sarif
+          additional_args: "--minimum-severity HIGH"
+ 
+      - name: Upload tfsec SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: tfsec.sarif
+          category: iac-tfsec
+ 
+# ═══════════════════════════════════════════════════════════════
+# JOB 5 — Build & Package
+# ═══════════════════════════════════════════════════════════════
+  build:
+    name: "🔨 Build & Package"
+    runs-on: ubuntu-latest
+    needs: [ sast-sonarqube, sca-owasp, iac-tfsec ]
+    outputs:
+      artifact-digest: ${{ steps.digest.outputs.digest }}
+      image-tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+ 
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+ 
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install build wheel
+ 
+      - name: Run unit tests
+        run: pytest tests/ --junitxml=reports/unit-tests.xml -v
+ 
+      - name: Build Python distribution
+        run: python -m build --wheel --outdir dist/
+ 
+      - name: Create deployment archive
+        run: |
+          mkdir -p artifact
+          cp -r dist/ artifact/
+          cp -r scripts/ artifact/ 2>/dev/null || true
+          cp requirements.txt artifact/
+          tar -czf ${{ env.ARTIFACT_NAME }}-${{ github.sha }}.tar.gz artifact/
+ 
+      # ── Artifact Integrity: SHA-256 digest ───────────────────
+      - name: Compute artifact digest
+        id: digest
+        run: |
+          DIGEST=$(sha256sum ${{ env.ARTIFACT_NAME }}-${{ github.sha }}.tar.gz | awk '{print $1}')
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "${DIGEST}  ${{ env.ARTIFACT_NAME }}-${{ github.sha }}.tar.gz" > artifact.sha256
+          echo "Artifact digest: ${DIGEST}"
+ 
+      # ── Artifact Signing with Sigstore / cosign ───────────────
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+ 
+      - name: Sign artifact with Sigstore (keyless OIDC)
+        run: |
+          cosign sign-blob             --yes             --bundle artifact.bundle             ${{ env.ARTIFACT_NAME }}-${{ github.sha }}.tar.gz
+ 
+      # ── SBOM Generation ──────────────────────────────────────
+      - name: Install Syft (SBOM generator)
+        uses: anchore/sbom-action/download-syft@v0
+ 
+      - name: Generate SBOM (SPDX + CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: "."
+          format: "spdx-json"
+          output-file: "sbom-spdx.json"
+ 
+      - name: Generate CycloneDX SBOM
+        run: |
+          pip install cyclonedx-bom
+          cyclonedx-py environment --output-format json --output-file sbom-cyclonedx.json
+ 
+      - name: Attest SBOM (GitHub Artifact Attestation)
+        uses: actions/attest-sbom@v1
+        with:
+          subject-path: ${{ env.ARTIFACT_NAME }}-${{ github.sha }}.tar.gz
+          sbom-path: sbom-spdx.json
+ 
+      # ── Upload artifacts ─────────────────────────────────────
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ github.sha }}
+          path: |
+            ${{ env.ARTIFACT_NAME }}-${{ github.sha }}.tar.gz
+            artifact.sha256
+            artifact.bundle
+            sbom-spdx.json
+            sbom-cyclonedx.json
+          retention-days: 30
+ 
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: reports/unit-tests.xml
+ 
+# ═══════════════════════════════════════════════════════════════
+# JOB 6 — Container Image Build & Aqua Scan
+#          (runs in parallel with build; merged at deploy gate)
+# ═══════════════════════════════════════════════════════════════
+  container-scan:
+    name: "🐳 Container Build & Aqua Security Scan"
+    runs-on: ubuntu-latest
+    needs: [ sast-sonarqube, sca-owasp ]
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+ 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+ 
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+ 
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+ 
+      - name: Build Docker image (no push yet)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+ 
+      # ── Aqua Security Trivy scan (OSS layer) ─────────────────
+      - name: Aqua Trivy — container vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          format: "sarif"
+          output: "trivy-container.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true
+ 
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-container.sarif
+          category: container-aqua
+ 
+      - name: Aqua Security Enterprise scan
+        if: ${{ secrets.AQUA_KEY != '' }}
+        uses: aquasecurity/aqua-security-action@v0.0.2
+        with:
+          image: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          username: ${{ secrets.AQUA_USERNAME }}
+          password: ${{ secrets.AQUA_PASSWORD }}
+          scanner: ${{ secrets.AQUA_SCANNER_URL }}
+ 
+      - name: Push image to GHCR
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+ 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+ 
+      - name: Sign container image (keyless)
+        run: |
+          cosign sign --yes             ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+ 
+      - name: Generate container SBOM with Syft
+        uses: anchore/sbom-action@v0
+        with:
+          image: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          format: "spdx-json"
+          output-file: "sbom-container.json"
+ 
+      - name: Attest container SBOM
+        uses: actions/attest-sbom@v1
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.meta.outputs.version }}
+          sbom-path: sbom-container.json
+          push-to-registry: true
+ 
+# ═══════════════════════════════════════════════════════════════
+# JOB 7 — Deploy to Staging (Azure VM)
+# ═══════════════════════════════════════════════════════════════
+  deploy-staging:
+    name: "🚀 Deploy → Staging (Azure VM)"
+    runs-on: ubuntu-latest
+    needs: [ build, container-scan ]
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL }}
+    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+ 
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ github.sha }}
+          path: dist/
+ 
+      - name: Verify artifact digest
+        run: |
+          cd dist
+          sha256sum -c artifact.sha256
+          echo "✅ Artifact integrity verified"
+ 
+      - name: Verify Sigstore signature
+        uses: sigstore/cosign-installer@v3
+ 
+      - name: Cosign blob verify
+        run: |
+          cosign verify-blob             --bundle dist/artifact.bundle             dist/${{ env.ARTIFACT_NAME }}-${{ github.sha }}.tar.gz
+          echo "✅ Artifact signature verified"
+ 
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+ 
+      - name: Upload artifact to Azure Blob (staging area)
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az storage blob upload               --account-name ${{ secrets.AZURE_STORAGE_ACCOUNT }}               --container-name deployments               --name "${{ env.ARTIFACT_NAME }}-${{ github.sha }}.tar.gz"               --file "dist/${{ env.ARTIFACT_NAME }}-${{ github.sha }}.tar.gz"               --auth-mode login
+ 
+      - name: Deploy application on Azure VM
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az vm run-command invoke               --resource-group ${{ env.AZURE_RESOURCE_GROUP }}               --name ${{ vars.AZURE_VM_NAME_STAGING }}               --command-id RunShellScript               --scripts "
+                set -euo pipefail
+                echo '--- Downloading artifact ---'
+                az storage blob download                   --account-name ${{ secrets.AZURE_STORAGE_ACCOUNT }}                   --container-name deployments                   --name '${{ env.ARTIFACT_NAME }}-${{ github.sha }}.tar.gz'                   --file /tmp/${{ env.ARTIFACT_NAME }}.tar.gz                   --auth-mode login
+ 
+                echo '--- Extracting ---'
+                mkdir -p /tmp/deploy-${{ github.sha }}
+                tar -xzf /tmp/${{ env.ARTIFACT_NAME }}.tar.gz -C /tmp/deploy-${{ github.sha }}
+ 
+                echo '--- Stopping service ---'
+                sudo systemctl stop ${{ env.ARTIFACT_NAME }} || true
+ 
+                echo '--- Installing ---'
+                sudo cp -r /tmp/deploy-${{ github.sha }}/artifact/* ${{ env.DEPLOY_PATH }}/
+                cd ${{ env.DEPLOY_PATH }}
+                sudo pip install -r requirements.txt --quiet
+ 
+                echo '--- Starting service ---'
+                sudo systemctl daemon-reload
+                sudo systemctl start ${{ env.ARTIFACT_NAME }}
+                sudo systemctl enable ${{ env.ARTIFACT_NAME }}
+ 
+                echo '--- Verifying ---'
+                sleep 5
+                sudo systemctl is-active --quiet ${{ env.ARTIFACT_NAME }} && echo 'Service running ✅' || exit 1
+              "
+ 
+      - name: Smoke test — staging health check
+        run: |
+          sleep 10
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ vars.STAGING_URL }}/health")
+          if [ "$HTTP_STATUS" -ne 200 ]; then
+            echo "❌ Health check failed: HTTP $HTTP_STATUS"
+            exit 1
+          fi
+          echo "✅ Health check passed: HTTP $HTTP_STATUS"
+ 
+# ═══════════════════════════════════════════════════════════════
+# JOB 8 — Integration & Security Regression Tests (Staging)
+# ═══════════════════════════════════════════════════════════════
+  integration-tests:
+    name: "🧪 Integration & Security Regression Tests"
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+ 
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+ 
+      - name: Install test dependencies
+        run: |
+          pip install pytest requests pytest-html
+ 
+      - name: Run integration tests against staging
+        env:
+          TARGET_URL: ${{ vars.STAGING_URL }}
+          API_KEY: ${{ secrets.STAGING_API_KEY }}
+        run: |
+          pytest tests/integration/             --base-url="$TARGET_URL"             --junitxml=reports/integration-tests.xml             --html=reports/integration-report.html             -v
+ 
+      - name: Upload integration test report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-test-report
+          path: reports/integration-report.html
+ 
+# ═══════════════════════════════════════════════════════════════
+# JOB 9 — DAST: OWASP ZAP (against staging)
+# ═══════════════════════════════════════════════════════════════
+  dast-zap:
+    name: "🕷️ DAST — OWASP ZAP Baseline"
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+ 
+      - name: OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: ${{ vars.STAGING_URL }}
+          rules_file_name: ".zap/rules.tsv"
+          cmd_options: "-a"
+          fail_action: true
+ 
+      - name: Upload ZAP SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: results.sarif
+          category: dast-zap
+ 
+# ═══════════════════════════════════════════════════════════════
+# JOB 10 — Deploy to Production (Azure VM)
+#           Requires manual approval via GitHub Environment
+# ═══════════════════════════════════════════════════════════════
+  deploy-production:
+    name: "🏁 Deploy → Production (Azure VM)"
+    runs-on: ubuntu-latest
+    needs: [ integration-tests, dast-zap ]
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL }}
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+ 
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ github.sha }}
+          path: dist/
+ 
+      - name: Verify artifact digest (production gate)
+        run: |
+          cd dist
+          sha256sum -c artifact.sha256
+          echo "✅ Artifact integrity verified for production"
+ 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+ 
+      - name: Verify Sigstore signature (production gate)
+        run: |
+          cosign verify-blob             --bundle dist/artifact.bundle             dist/${{ env.ARTIFACT_NAME }}-${{ github.sha }}.tar.gz
+          echo "✅ Artifact signature verified for production"
+ 
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+ 
+      - name: Upload artifact to Azure Blob
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az storage blob upload               --account-name ${{ secrets.AZURE_STORAGE_ACCOUNT }}               --container-name deployments               --name "${{ env.ARTIFACT_NAME }}-${{ github.sha }}.tar.gz"               --file "dist/${{ env.ARTIFACT_NAME }}-${{ github.sha }}.tar.gz"               --auth-mode login               --overwrite
+ 
+      - name: Deploy to production Azure VM
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az vm run-command invoke               --resource-group ${{ env.AZURE_RESOURCE_GROUP }}               --name ${{ vars.AZURE_VM_NAME_PRODUCTION }}               --command-id RunShellScript               --scripts "
+                set -euo pipefail
+                echo '--- Downloading artifact ---'
+                az storage blob download                   --account-name ${{ secrets.AZURE_STORAGE_ACCOUNT }}                   --container-name deployments                   --name '${{ env.ARTIFACT_NAME }}-${{ github.sha }}.tar.gz'                   --file /tmp/${{ env.ARTIFACT_NAME }}.tar.gz                   --auth-mode login
+ 
+                echo '--- Backing up current deployment ---'
+                sudo cp -r ${{ env.DEPLOY_PATH }} ${{ env.DEPLOY_PATH }}.bak.$(date +%Y%m%d%H%M%S) || true
+ 
+                echo '--- Extracting new version ---'
+                mkdir -p /tmp/deploy-${{ github.sha }}
+                tar -xzf /tmp/${{ env.ARTIFACT_NAME }}.tar.gz -C /tmp/deploy-${{ github.sha }}
+ 
+                echo '--- Stopping service ---'
+                sudo systemctl stop ${{ env.ARTIFACT_NAME }}
+ 
+                echo '--- Deploying new version ---'
+                sudo cp -r /tmp/deploy-${{ github.sha }}/artifact/* ${{ env.DEPLOY_PATH }}/
+                cd ${{ env.DEPLOY_PATH }}
+                sudo pip install -r requirements.txt --quiet
+ 
+                echo '--- Starting service ---'
+                sudo systemctl daemon-reload
+                sudo systemctl start ${{ env.ARTIFACT_NAME }}
+                sudo systemctl enable ${{ env.ARTIFACT_NAME }}
+ 
+                echo '--- Verifying ---'
+                sleep 10
+                sudo systemctl is-active --quiet ${{ env.ARTIFACT_NAME }} && echo 'Service running ✅' || exit 1
+              "
+ 
+      - name: Production health check
+        run: |
+          sleep 15
+          for i in 1 2 3; do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ vars.PRODUCTION_URL }}/health")
+            if [ "$HTTP_STATUS" -eq 200 ]; then
+              echo "✅ Production health check passed: HTTP $HTTP_STATUS"
+              exit 0
+            fi
+            echo "Attempt $i failed (HTTP $HTTP_STATUS), retrying in 10s..."
+            sleep 10
+          done
+          echo "❌ Production health check failed after 3 attempts"
+          exit 1
+ 
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            dist/${{ env.ARTIFACT_NAME }}-${{ github.sha }}.tar.gz
+            dist/artifact.sha256
+            dist/sbom-spdx.json
+            dist/sbom-cyclonedx.json
+          generate_release_notes: true
+          make_latest: true
+ 
+# ═══════════════════════════════════════════════════════════════
+# JOB 11 — Notify
+# ═══════════════════════════════════════════════════════════════
+  notify:
+    name: "📣 Notify"
+    runs-on: ubuntu-latest
+    needs: [ deploy-production ]
+    if: always()
+    steps:
+      - name: Slack notification
+        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+ 
+      - name: Teams notification
+        if: ${{ secrets.TEAMS_WEBHOOK_URL != '' }}
+        uses: toko-bifrost/ms-teams-deploy-card@master
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          webhook-uri: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          card-layout-exit: complete
+          show-on-exit: true
+          environment: production
